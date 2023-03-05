@@ -18,6 +18,7 @@
 #define SV_IMPLEMENTATION
 #include "sv.h"
 #include "http_status_code.h"
+#include "threadpool.h"
 
 #define ENDL "\r\n"
 #define handle_error(msg) do { perror(msg); exit(EXIT_FAILURE); } while (0)
@@ -255,6 +256,21 @@ void handle_connection(int clientfd, struct sockaddr* client, socklen_t client_l
     }
 }
 
+struct HTTP_Connection {
+  int client_fd;
+  struct sockaddr* client_addr;
+  socklen_t client_addr_len;
+
+  bool close_on_first_responce;
+};
+
+void child_main(struct HTTP_Connection* conn) {
+  handle_connection(conn->client_fd, conn->client_addr, conn->client_addr_len);
+  close(conn->client_fd);
+
+  free(conn);
+}
+
 int main() {
   int port = 8080;
   int s = init_socket(port);
@@ -265,16 +281,24 @@ int main() {
   printf("Serving files in \"%s\"\n", temp_cwd);
   printf("Listening on port %d\n", port);
 
+  threadpool_t* tp = threadpool_create(5, 50, 0);
+  
   while (1) {
-    struct sockaddr_in client_addr;
-    socklen_t len = sizeof(client_addr);
-    int c = accept(s, (struct sockaddr*) &client_addr, &len);
-    if (c == -1)
-      handle_error("accept");
+    struct HTTP_Connection* conn = malloc(sizeof(struct HTTP_Connection));
+    struct sockaddr_in client_addr = {0};
+    conn->client_addr_len = sizeof(client_addr);
 
-    handle_connection(c, (struct sockaddr*) &client_addr, len);
-      
-    close(c);
+    conn->client_fd = accept(s, (struct sockaddr*) &client_addr, &(conn->client_addr_len));
+    if (conn->client_fd == -1)
+      handle_error("accept");
+    
+    conn->client_addr = (struct sockaddr*)&client_addr;
+    conn->close_on_first_responce = true;
+
+    if (threadpool_add(tp, (void (*)(void *))child_main, conn, 0) < 0){
+      fprintf(stderr, "threadpool_add error");
+      return EXIT_FAILURE;
+    }
   }
   
   printf("End\n");
