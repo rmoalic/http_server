@@ -1,3 +1,4 @@
+#include <netinet/in.h>
 #define _GNU_SOURCE 1
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,8 @@
 #define ENDL "\r\n"
 #define handle_error(msg) do { perror(msg); exit(EXIT_FAILURE); } while (0)
 
+#define NB_CLIENT_MAX 1000
+
 String_View cwd = {0};
 
 int init_socket(int port) {
@@ -45,7 +48,7 @@ int init_socket(int port) {
   if (bind(s, (struct sockaddr*) &my_addr, sizeof(my_addr)) == -1)
     handle_error("bind");
 
-  if (listen(s, 50) == -1)
+  if (listen(s, NB_CLIENT_MAX) == -1)
     handle_error("listen");
 
   return s;
@@ -79,7 +82,6 @@ bool send_file(const int clientfd, const char* path, ssize_t size) {
   int filefd = open(path, O_RDONLY | O_NOFOLLOW | O_NOATIME);
   if (filefd == -1) {
     perror("open");
-    goto clean;
   }
 
   ssize_t sent = sendfile(clientfd, filefd, NULL, size);
@@ -87,10 +89,11 @@ bool send_file(const int clientfd, const char* path, ssize_t size) {
     perror("sendfile");
     goto clean;
   }
+  close(filefd);
   return true;
 
  clean:
-  close(clientfd);
+  close(filefd);
   return false;
 }
 
@@ -160,16 +163,20 @@ bool consume_HTTP_header(String_View* svbuf, struct HTTPHeader* header) {
 
 void handle_connection(int clientfd, struct sockaddr* client, socklen_t client_len) {
     char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
-    
-    if (getnameinfo(client, client_len, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+
+    int getnameinfo_ret = getnameinfo(client, client_len, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (getnameinfo_ret == 0)
       printf("host=%s, serv=%s\n", hbuf, sbuf);
     else
-      printf("could not getnameinfo\n");
+      printf("could not getnameinfo: %s\n", gai_strerror(getnameinfo_ret));
 
 
     char buff[1500] = {0};
 
     int nb = read(clientfd, buff, 1499);
+    if (nb == -1) {
+      return;
+    }
     buff[nb + 1] = '\0';
     
     struct HTTPHeader header = {0};
@@ -187,6 +194,7 @@ void handle_connection(int clientfd, struct sockaddr* client, socklen_t client_l
       // TODO: remove query parameters '?' '#'
       // TODO: redirect if path ends with /
       // TODO: look for index.html
+      // TODO: URLDecode path
 
       char* resolved_path = NULL;
       resolved_path = realpath(path, NULL);
@@ -250,9 +258,12 @@ void handle_connection(int clientfd, struct sockaddr* client, socklen_t client_l
         closedir(dir);
       }
 
-      if (resolved_path != NULL)
+      if (resolved_path != NULL) {
         free(resolved_path);
+      }
     end:
+      // refactor
+      printf("refactor\n");
     }
 }
 
@@ -279,9 +290,9 @@ int main() {
   cwd = sv_from_cstr(temp_cwd);
 
   printf("Serving files in \"%s\"\n", temp_cwd);
-  printf("Listening on port %d\n", port);
+  printf("Listening on port http://0.0.0.0:%d/\n", port);
 
-  threadpool_t* tp = threadpool_create(5, 50, 0);
+  threadpool_t* tp = threadpool_create(5, NB_CLIENT_MAX, 0);
   
   while (1) {
     struct HTTP_Connection* conn = malloc(sizeof(struct HTTP_Connection));
