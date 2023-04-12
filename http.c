@@ -1,11 +1,10 @@
-#include "http_status_code.h"
-#include <stddef.h>
 #define _GNU_SOURCE 1
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <time.h>
+#include <stddef.h>
 #include <errno.h>
 #include <assert.h>
 #include <dirent.h>
@@ -16,7 +15,28 @@
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 
+#include "http_status_code.h"
 #include "http.h"
+
+static int decodeURIComponent (char *sSource, char *sDest) { // https://stackoverflow.com/a/20437049
+  assert(sSource != NULL);
+  assert(sDest != NULL);
+  int nLength;
+  for (nLength = 0; *sSource; nLength++) {
+    if (*sSource == '%' && sSource[1] && sSource[2] && isxdigit(sSource[1]) && isxdigit(sSource[2])) {
+      sSource[1] -= sSource[1] <= '9' ? '0' : (sSource[1] <= 'F' ? 'A' : 'a')-10;
+      sSource[2] -= sSource[2] <= '9' ? '0' : (sSource[2] <= 'F' ? 'A' : 'a')-10;
+      sDest[nLength] = 16 * sSource[1] + sSource[2];
+      sSource += 3;
+      continue;
+    }
+    sDest[nLength] = *sSource++;
+  }
+  sDest[nLength] = '\0';
+  return nLength;
+}
+
+#define implodeURIComponent(url) decodeURIComponent(url, url)
 
 static int http_send_status_line(struct HTTP_Connection* conn, struct HTTP_Response* resp) {
   #define buff_size 50
@@ -197,7 +217,7 @@ static void http_send_error(struct HTTP_Connection* conn, struct HTTP_Response* 
   assert(resp->response_code < HTTPSC_LAST_VALUE);
   struct http_status_code_s code = http_status_codes[resp->response_code];
 
-  size_t s =send(conn->client_fd, code.text, strlen(code.text), 0);
+  ssize_t s = send(conn->client_fd, code.text, strlen(code.text), 0);
   if (s == -1) {
     fprintf(stderr, "Error: http_send_error send\n");
     return;
@@ -239,7 +259,7 @@ static void http_serve_file(struct HTTP_Connection* conn, struct HTTP_Request* r
 
   resp->response_code = HTTPSC_OK;
   http_add_header(resp, "Cache-control", SV("public"));
-  http_add_header(resp, "Content-Type", SV("text/html"));
+  http_add_header(resp, "Content-Type", SV("text/plain"));
 
   struct tm * mtim = gmtime(&(filestat.st_mtim.tv_sec));
   char content_size_str[20];
@@ -253,7 +273,7 @@ static void http_serve_file(struct HTTP_Connection* conn, struct HTTP_Request* r
 
   http_send_headers(conn, resp);
       
-  size_t s = send_file(conn->client_fd, path, filestat.st_size);
+  ssize_t s = send_file(conn->client_fd, path, filestat.st_size);
   if (s == -1) {
     return;
   };
@@ -269,6 +289,8 @@ static void http_serve_directory(struct HTTP_Connection* conn, struct HTTP_Reque
     http_send_error(conn, resp);
     return;
   }
+
+  //TODO: file name encoding
 
   resp->response_code = HTTPSC_OK;
   http_add_header(resp, "Cache-control", SV("no-cache"));
@@ -308,70 +330,103 @@ void http_handle_connection(struct HTTP_Connection* conn) {
   strftime(time_buff, 39, "%a, %d %b %Y %H:%M:%S %Z", now);
 
   http_add_header(&response, "Date", sv_from_cstr(time_buff));
- 
+
   String_View svbuf = sv_from_parts(buff, nb);
   if (! consume_HTTP_header(&svbuf, &request)) {
     response.response_code = HTTPSC_RequestHeaderFieldsTooLarge;
     http_send_error(conn, &response);
-    goto end;
+
+    apache2_log_response(conn, &request, &response);
+    return;
   }
 
   if (svbuf.data[0] != '\0') { // TODO: fix sketchy length
     printf("rest: " SV_Fmt "\n", SV_Arg(svbuf));
   }
 
-  if (request.path.count > 1) {
-    char path[request.path.count];
-    memcpy(path, request.path.data + 1, request.path.count - 1);
-    path[request.path.count - 1] = '\0';
-    // TODO: remove query parameters '?' '#'
-    // TODO: redirect if path ends with /
-    // TODO: look for index.html
-    // TODO: URLDecode path
+  char path[request.path.count + 1];
+  memcpy(path, request.path.data, request.path.count);
+  path[request.path.count] = '\0';
 
-    char* resolved_path = NULL;
-    resolved_path = realpath(path, NULL);
-    if (resolved_path == NULL) {
-      if (errno == ENOENT) {
-        response.response_code = HTTPSC_NotFound;
-        http_send_error(conn, &response);
-      } else if (errno == EACCES) {
-        response.response_code = HTTPSC_Forbidden;
-        http_send_error(conn, &response);
-        perror("realpath");
-      } else {
-        response.response_code = HTTPSC_InternalServerError;
-        http_send_error(conn, &response);
-        perror("realpath");
-      }
+  char* wpath;
+  if (request.path.count > 1) {
+    //TODO: anchor parsing
+    char* anchor = strchr(path, '#');
+    if (anchor != NULL) {
+      *anchor = '\0';
+    }
+
+    //TODO: query parameters parsing
+    char* query  = strchr(path, '?');
+    if (query != NULL) {
+      *query = '\0';
+    }
+
+    size_t path_len = strlen(path);
+    size_t path_len_no_trailing_slash = path_len;
+    while (path[path_len_no_trailing_slash - 1] == '/') {
+      path_len_no_trailing_slash = path_len_no_trailing_slash - 1;
+    }
+    if (path_len > path_len_no_trailing_slash) {
+      response.response_code = HTTPSC_MovedPermanently;
+      response.header_only = true;
+      http_add_header(&response, "Location", sv_from_parts(path, path_len_no_trailing_slash));
+      http_send_headers(conn, &response);
       goto end;
     }
 
-    if (strncmp(current_working_directory.data, resolved_path, current_working_directory.count) != 0) {
-      // hide files not in working directory
+    implodeURIComponent(path);
+
+    wpath = path + 1;
+  } else {
+    wpath = path;
+    wpath[0] = '.';
+  }
+  // TODO: look for index.html
+
+  char* resolved_path = NULL;
+  resolved_path = realpath(wpath, NULL);
+  if (resolved_path == NULL) {
+    if (errno == ENOENT) {
       response.response_code = HTTPSC_NotFound;
       http_send_error(conn, &response);
-      goto end;
+    } else if (errno == EACCES) {
+      response.response_code = HTTPSC_Forbidden;
+      http_send_error(conn, &response);
+      perror("realpath");
+    } else {
+      response.response_code = HTTPSC_InternalServerError;
+      http_send_error(conn, &response);
+      perror("realpath");
     }
-
-    char* web_path = resolved_path + current_working_directory.count;
-
-    struct stat statbuf;
-    if (stat(resolved_path, &statbuf) == -1) {
-      perror("fstat");
-      goto end;
-    }
-
-    if (S_ISREG(statbuf.st_mode)) {
-      http_serve_file(conn, &request, &response, resolved_path, statbuf);
-    } else if (S_ISDIR(statbuf.st_mode)) {
-      http_serve_directory(conn, &request, &response, resolved_path, web_path);
-    }
-
-    if (resolved_path != NULL) {
-      free(resolved_path);
-    }
+    goto end;
   }
+
+  if (strncmp(current_working_directory.data, resolved_path, current_working_directory.count) != 0) {
+    // hide files not in working directory
+    response.response_code = HTTPSC_NotFound;
+    http_send_error(conn, &response);
+    goto end;
+  }
+
+  char* web_path = resolved_path + current_working_directory.count;
+
+  struct stat statbuf;
+  if (stat(resolved_path, &statbuf) == -1) {
+    perror("fstat");
+    goto end;
+  }
+
+  if (S_ISREG(statbuf.st_mode)) {
+    http_serve_file(conn, &request, &response, resolved_path, statbuf);
+  } else if (S_ISDIR(statbuf.st_mode)) {
+    http_serve_directory(conn, &request, &response, resolved_path, web_path);
+  }
+
+  if (resolved_path != NULL) {
+    free(resolved_path);
+  }
+
  end:
   apache2_log_response(conn, &request, &response);
 }

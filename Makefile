@@ -1,6 +1,6 @@
 CC=gcc
 WARNINGS=-Wall -Wextra -Wmissing-prototypes -Wshadow -Wno-unused-parameter
-CFLAGS=-g -O2 -MMD -MP -pedantic $(WARNINGS)
+CFLAGS=-g -O2 -MMD -MP -pedantic -pthread $(WARNINGS)
 
 .PHONY: all bin clean
 
